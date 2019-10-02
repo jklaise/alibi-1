@@ -54,6 +54,9 @@ st.sidebar.markdown(
     """
 )
 
+# sidebar controls
+threshold = st.sidebar.slider(label='Precision threshold:', min_value=0.0, max_value=1.0, value=0.9)
+
 # dataset
 st.title('Adult income dataset')
 st.dataframe(raw_data, height=200)
@@ -82,6 +85,9 @@ st.altair_chart(chart)
 # explanations
 explain = st.button('Explain prediction!')
 if explain:
-    explanation = explainer.explain(x)
-    st.write('Anchor explanation:')
+    explanation = explainer.explain(x, threshold=threshold)
+    precision = explanation['precision']
+    if precision < threshold:
+        st.warning('Could not find an anchor satisfying the {:.2f} precision threshold'.format(threshold))
+    st.write('Anchor explanation with precision {:.2f}:'.format(precision))
     st.write(explanation['names'])
