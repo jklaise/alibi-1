@@ -1,4 +1,5 @@
 import alibi
+import altair as alt
 import io
 import joblib
 import pandas as pd
@@ -63,8 +64,20 @@ instance = st.text_input(label='Select an instance to make a prediction:', value
 # prediction
 x = data.data[int(instance)].reshape(1, -1)
 pred = model.predict_proba(x)
+
+# prediction bar chart
 st.write('Model prediction:')
-st.write(pred)
+p = pd.DataFrame(pred.T, index=data.target_names).reset_index()
+p.columns = ['Income', 'Probability']
+chart = alt.Chart(p).mark_bar(size=30).encode(
+    y='Probability:Q',
+    x='Income:O',
+    opacity=alt.condition(
+        alt.datum.Probability > 0.5,
+        alt.value(1),
+        alt.value(0.5)
+    )).properties(width=200).configure_axisX(labelAngle=0)
+st.altair_chart(chart)
 
 # explanations
 explain = st.button('Explain prediction!')
