@@ -1,0 +1,6 @@
+alibi
+joblib
+pandas
+requests
+scikit-learn==0.20.3
+streamlit
