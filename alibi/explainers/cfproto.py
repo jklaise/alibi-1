@@ -982,6 +982,7 @@ class CounterFactualProto:
 
         # find closest prototype in the target class list
         dist_proto = {}
+        self.idx_proto = {} # type: dict
         if self.enc_model:
 
             X_enc = self.enc.predict(X)
@@ -996,6 +997,7 @@ class CounterFactualProto:
                     dist_k = np.linalg.norm(X_enc.reshape(X_enc.shape[0], -1) -
                                             v.reshape(v.shape[0], -1), axis=1)
                     idx = np.argsort(dist_k)[:k]
+                    self.idx_proto[c] = idx
                     if k_type == 'mean':
                         dist_proto[c] = np.mean(dist_k[idx])
                     else:
