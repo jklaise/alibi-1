@@ -1,4 +1,5 @@
 import copy
+import logging
 import numpy as np
 from typing import Callable, Dict, Optional, Tuple, Union
 from typing_extensions import Literal
@@ -7,15 +8,18 @@ from alibi.api.interfaces import Explanation, Explainer, FitMixin
 from alibi.api.defaults import DEFAULT_META_CEM
 from alibi.explainers.base.counterfactuals import CounterfactualBase, logger
 from alibi.explainers.exceptions import CEMError
+from alibi.utils.wrappers import get_blackbox_wrapper
 from alibi.utils.logging import DEFAULT_LOGGING_OPTS
 
 CEM_CONST_OPTS_DEFAULT = {
-    'c_init': 10.,
-    'c_steps': 10,
+    'const_init': 1000000.,
+    'const_lower_bound': 0.,
+    'const_upper_bound': 1e10,
+    'max_const_steps': 10,
 }
 
 CEM_SEARCH_OPTS_DEFAULT = {
-    'max_iter': 1000
+    'max_iter': 100
 }
 
 CEM_METHOD_OPTS = {
@@ -29,6 +33,23 @@ CEM_METHOD_OPTS = {
 
 CEM_VALID_NO_INFO_TYPES = ['mean', 'median']
 CEM_VALID_EXPLAIN_MODES = ['PP', 'PN', 'both']
+
+CEM_LOGGING_OPTS_DEFAULT = copy.deepcopy(DEFAULT_LOGGING_OPTS)
+
+
+def _validate_cem_loss_spec(loss_spec: dict, predictor_type: str) -> None:
+    if not loss_spec:
+        return
+
+
+# TODO: duplicate from experimental/counterfactuals.py
+def _convert_to_label(Y: np.ndarray, threshold: float = 0.5) -> int:
+    # TODO: ALEX: TBD: Parametrise `threshold` in explain or do we assume people always assign labels on this rule?
+
+    if Y.shape[1] == 1:
+        return int(Y > threshold)
+    else:
+        return np.argmax(Y)
 
 
 class CEM(Explainer, FitMixin):
@@ -71,7 +92,7 @@ class CEM(Explainer, FitMixin):
                 optimizer_opts: Optional[dict] = None,
                 method_opts: Optional[dict] = None) -> "Explanation":
 
-        self._check_mode(mode)
+        # self._validate_mode(mode)
 
         # TODO: the following boilerplate seems common to many methods
         # override default method settings with user input
@@ -93,11 +114,9 @@ class CEM(Explainer, FitMixin):
             optimizer_opts=optimizer_opts
         )
 
-        return self._build_explanation(X, result)
+        self._update_metadata({'mode': mode}, params=True)
 
-    def _check_mode(self, mode: str):
-        if mode not in CEM_VALID_EXPLAIN_MODES:
-            raise CEMError(f"Unknown mode {mode}. Valid explanations modes are {CEM_VALID_EXPLAIN_MODES}.")
+        return self._build_explanation(X, result)
 
     def _build_explanation(self, X: np.ndarray, result: dict) -> Explanation:
         result['instance'] = X
@@ -118,9 +137,31 @@ class _CEM(CounterfactualBase):
                  feature_range: Union[Tuple[Union[float, np.ndarray], Union[float, np.ndarray]], None] = None,
                  **kwargs
                  ):
-        ...
 
+        _validate_cem_loss_spec(loss_spec, predictor_type)
+        blackbox_wrapper = get_blackbox_wrapper(framework) if predictor_type == 'blackbox' else None
         self.fitted = False
+
+        super().__init__(
+            predictor,
+            framework,
+            loss_spec,
+            CEM_METHOD_OPTS,
+            feature_range,
+            predictor_type=predictor_type,
+            # can pass additional kwargs for backend initialization like this
+            backend_kwargs={'blackbox_wrapper': blackbox_wrapper},
+            predictor_device=kwargs.get("predictor_device", None)
+        )
+
+        self.backend.device = None
+
+        # override defaults with user input
+        self.set_expected_attributes(method_opts)
+
+        # set default options for logging (updated from the API class)
+        self.logging_opts = copy.deepcopy(CEM_LOGGING_OPTS_DEFAULT)
+        self.log_traces = self.logging_opts['log_traces']
 
     def fit(self,
             X: Optional[np.ndarray] = None,
@@ -158,10 +199,104 @@ class _CEM(CounterfactualBase):
             no_info_type_ = no_info_type
         self.no_info_type = no_info_type_
 
-    def cem(self):
+    def _validate_mode(self, mode: str):
+        if mode not in CEM_VALID_EXPLAIN_MODES:
+            raise CEMError(f"Unknown mode {mode}. Valid explanations modes are {CEM_VALID_EXPLAIN_MODES}.")
+        self.mode = mode
 
-    def PP(self):
+    def cem(self,
+            instance: np.ndarray,
+            mode: str,
+            optimizer: Optional['tf.keras.optimizers.Optimizer'] = None,
+            optimizer_opts: Optional[Dict] = None
+            ):
+        self._validate_mode(mode)
+
+        # check inputs
+        if instance.shape[0] != 1:
+            raise CEMError(
+                f"Only single instance explanations supported (leading dim = 1). Got leading dim = {instance.shape[0]}",
+            )
+
+        y = self.backend.make_prediction(self.backend.to_tensor(instance))
+        y = self.backend.to_numpy_arr(y)
+        instance_class = _convert_to_label(y)
+        instance_proba = y[:, instance_class].item()
+
+        self.initialise_variables(
+            instance,
+            instance_class,
+            instance_proba,
+            self.mode
+        )
+
+        self.backend.set_optimizer(optimizer, optimizer_opts)
+        self.setup_tensorboard()
+        if self.logging_opts['verbose']:
+            logging.basicConfig(level=logging.DEBUG)
+
+        # TODO: where to parallelize?
+        result = self.search(initial=instance)
+
+        result['instance_class'] = instance_class
+        result['instance_proba'] = instance_proba
+        self.backend.reset_optimizer()
+        self.reset_step()
+
+        return result
+
+    def initialise_variables(self,
+                             instance: np.ndarray,
+                             instance_class: int,
+                             instance_proba: float,
+                             mode: str,
+                             *args,
+                             **kwargs) -> None:
+        self.backend.initialise_variables(instance=instance, mode=mode, instance_class=instance_class,
+                                          instance_proba=instance_proba)
+        self.instance = instance
+        self.instance_class = instance_class
+        self.instance_proba = instance_proba
+
+    def search(self, *, initial: np.ndarray) -> dict:
+
+        # set the lower and upper bounds for the constant 'c' to scale the attack loss term
+        # these bounds are updated for each c_step iteration
+        const_lb = self.const_lower_bound
+        cont_ub = self.const_upper_bound
+        const = self.const_init
+
+        # initial values for the best instance
+
+        # iterate over the number of updates for 'const'
+        for const_step in range(self.max_const_steps):
+            self.const = const
+            self.backend.const = const
+
+            # reset learning rate
+            self.backend.reset_optimizer()
+
+            for gd_step in range(self.max_iter):
+                self.backend.step(mode=self.mode)
+                self.step += 1
+
+        return {'solution': self.backend.solution}
+
+    def bisect_const(self):
         ...
 
-    def PN(self):
+    def compare(self, x: Union[float, int, np.ndarray], y: int) -> bool:
+        if not isinstance(x, (float, int, np.int64)):
+            x = np.copy(x)
+            if self.mode == "PP":
+                x[y] -= self.kappa
+            elif self.mode == "PN":
+                x[y] += self.kappa
+            x = np.argmax(x)
+        if self.mode == "PP":
+            return x == y
+        else:
+            return x != y
+
+    def reset_step(self):
         ...
