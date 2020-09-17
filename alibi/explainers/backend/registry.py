@@ -3,7 +3,7 @@ import inspect
 
 from alibi.utils.frameworks import FRAMEWORKS
 from collections import defaultdict
-from typing import Dict
+from typing import Dict, Optional
 from typing_extensions import Literal
 
 """
@@ -22,7 +22,7 @@ def framework_factory():
     A factory function that returns a mapping where objects implementing black- and white-box variants of a certain
     algorithm backend can be stored.
     """
-    return {'blackbox': None, 'whitebox': None}
+    return {'blackbox': {}, 'whitebox': {}}
 
 
 backends_registry = {
@@ -43,7 +43,8 @@ The backends registry is a dictionary, structured as follows::
 """
 
 
-def register_backend(consumer_class: str, predictor_type: Literal['whitebox', 'blackbox'] = 'whitebox'):
+def register_backend(consumer_class: str, predictor_type: Literal['whitebox', 'blackbox'] = 'whitebox',
+                     tag: Optional[str] = 'default'):
     """
     A parametrized decorator that can be used to register a class that contains PyTorch or TensorFlow backend
     implementations for explainers. The decorator is used to access the implementations in various modules in the
@@ -89,7 +90,8 @@ def register_backend(consumer_class: str, predictor_type: Literal['whitebox', 'b
             raise ValueError(
                 f"Framework must be 'pytorch' or 'tensorflow' but got {framework}"
             )
-        backends_registry[framework][consumer_class][predictor_type] = obj
+        backends_registry[framework][consumer_class][predictor_type][tag] = obj
+
         return obj
 
     return register
@@ -97,7 +99,8 @@ def register_backend(consumer_class: str, predictor_type: Literal['whitebox', 'b
 
 def load_backend(class_name: str,
                  framework: Literal['pytorch', 'tensorflow'],
-                 predictor_type: Literal['blackbox', 'whitebox']):
+                 predictor_type: Literal['blackbox', 'whitebox'],
+                 tag: Optional[str] = 'default'):
     """
     Update the backend registry returns the backend for the class specified by `class_name`. _It assumes that the name 
     of the module where the backend is implemented is the same as the name of the calling context._
@@ -122,4 +125,5 @@ def load_backend(class_name: str,
     # update the backend registry
     importlib.import_module(backend_module)
 
-    return backends_registry[framework][class_name][predictor_type]
+
+    return backends_registry[framework][class_name][predictor_type][tag]

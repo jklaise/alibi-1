@@ -5,6 +5,7 @@ from typing_extensions import Literal
 
 from alibi.api.interfaces import Explanation, Explainer, FitMixin
 from alibi.api.defaults import DEFAULT_META_CEM
+from alibi.explainers.backend import load_backend
 from alibi.explainers.base.counterfactuals import CounterfactualBase, logger
 from alibi.explainers.exceptions import CEMError
 from alibi.utils.logging import DEFAULT_LOGGING_OPTS
@@ -29,6 +30,11 @@ CEM_METHOD_OPTS = {
 
 CEM_VALID_NO_INFO_TYPES = ['mean', 'median']
 CEM_VALID_EXPLAIN_MODES = ['PP', 'PN', 'both']
+
+
+def _validate_cem_loss_spec(loss_spec: dict, predictor_type: str) -> None:
+    if not loss_spec:
+        return
 
 
 class CEM(Explainer, FitMixin):
@@ -93,6 +99,8 @@ class CEM(Explainer, FitMixin):
             optimizer_opts=optimizer_opts
         )
 
+        self._update_metadata({'mode': mode}, params=True)
+
         return self._build_explanation(X, result)
 
     def _check_mode(self, mode: str):
@@ -118,9 +126,32 @@ class _CEM(CounterfactualBase):
                  feature_range: Union[Tuple[Union[float, np.ndarray], Union[float, np.ndarray]], None] = None,
                  **kwargs
                  ):
-        ...
 
+        _validate_cem_loss_spec(loss_spec, predictor_type)
         self.fitted = False
+
+        self.load_backend(predictor=predictor, framework=framework, predictor_type=predictor_type,
+                          loss_spec=loss_spec, feature_range=feature_range)
+
+    def load_backend(self,
+                     predictor,
+                     framework: Literal["pytorch", "tensorflow"],
+                     predictor_type: Literal["blackbox", "whitebox"],
+                     loss_spec: Optional[Dict] = None,
+                     feature_range: Union[Tuple[Union[float, np.ndarray], Union[float, np.ndarray]], None] = None,
+                     **kwargs):
+        self.backends = dict.fromkeys(['PP', 'PN'])
+        # load both backends
+        for mode in self.backends.keys():
+            backend = load_backend(
+                class_name=self.__class__.__name__,
+                framework=framework,
+                predictor_type=kwargs.get("predictor_type", predictor_type),
+                tag=mode
+            )
+            backend_kwargs = kwargs.get(f"backend_{mode}_kwargs", {})
+            backend = backend(predictor, mode, loss_spec, feature_range, **backend_kwargs)
+            self.backends[mode] = backend
 
     def fit(self,
             X: Optional[np.ndarray] = None,
@@ -158,10 +189,14 @@ class _CEM(CounterfactualBase):
             no_info_type_ = no_info_type
         self.no_info_type = no_info_type_
 
-    def cem(self):
+    def cem(self,
+            X: np.ndarray,
+            mode: str,
+            optimizer: Optional['tf.keras.optimizers.Optimizer'] = None,
+            optimizer_opts: Optional[Dict] = None
+            ):
+        # select PP or PN backend
+        backend = self.backends[mode]
 
-    def PP(self):
-        ...
-
-    def PN(self):
-        ...
+        # TODO: do both as well
+        return {'backend_class_name': backend.__class__.__name__}

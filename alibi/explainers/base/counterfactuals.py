@@ -85,19 +85,24 @@ class CounterfactualBase:
         else:
             self.predictor_device = predictor_device
 
-        backend = load_backend(
-            class_name=self.__class__.__name__,
-            framework=framework,
-            predictor_type=kwargs.get("predictor_type", predictor_type)
-        )
-        backend_kwargs = kwargs.get("backend_kwargs", {})
-        self.backend = backend(predictor, loss_spec, feature_range, **backend_kwargs)
+        # backend = load_backend(
+        #    class_name=self.__class__.__name__,
+        #    framework=framework,
+        #    predictor_type=kwargs.get("predictor_type", predictor_type)
+        # )
+        # backend_kwargs = kwargs.get("backend_kwargs", {})
+        # self.backend = backend(predictor, loss_spec, feature_range, **backend_kwargs)
         # track attributes set
+
+        self.load_backend(predictor=predictor, framework=framework, predictor_type=predictor_type,
+                          loss_spec=loss_spec, feature_range=feature_range)
+
         self._expected_attributes = set()
         # create attributes and set them with default values, passed by sub-class
         self.set_attributes(method_opts)
         # TODO: ALEX: TBD: ATTRS "POLICE"
-        self._expected_attributes |= self.backend._expected_attributes
+        for _, backend in self.backends.items():
+            self._expected_attributes |= backend._expected_attributes
         self.set_expected_attributes = partial(self.set_attributes, expected=self._expected_attributes)
 
         # placeholders for options passed at runtime.
@@ -116,6 +121,25 @@ class CounterfactualBase:
 
     def __getattr__(self, key: Any) -> Any:
         return self.__getattribute__(key)
+
+    def load_backend(self,
+                     predictor,
+                     framework: Literal["pytorch", "tensorflow"],
+                     predictor_type: Literal["blackbox", "whitebox"],
+                     loss_spec: Optional[Dict] = None,
+                     feature_range: Union[Tuple[Union[float, np.ndarray], Union[float, np.ndarray]], None] = None,
+                     **kwargs):
+        """
+        Method to be overriden in classes that need multiple backends.
+        """
+        backend = load_backend(
+            class_name=self.__class__.__name__,
+            framework=framework,
+            predictor_type=kwargs.get("predictor_type", predictor_type)
+        )
+        backend_kwargs = kwargs.get("backend_kwargs", {})
+        self.backend = backend(predictor, loss_spec, feature_range, **backend_kwargs)
+        self.backends = {'CF': self.backend}
 
     def set_attributes(self, attrs: Union[Mapping[str, Any], None], expected: Optional[Set[str]] = None) -> None:
         """

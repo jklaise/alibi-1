@@ -47,6 +47,7 @@ def cem_loss(c: float, pred: tf.Tensor, distance: tf.Tensor, ae: tf.Tensor) -> t
 CEM_LOSS_SPEC_WHITEBOX = {
     'PP_prediction': {'fcn': None, 'kwargs': {}},
     'PN_prediction': {'fcn': None, 'kwargs': {}},
+    'prediction': {},  # either PP or PN determined at runtime
     'distance': {'fcn': elastic_net_loss, 'kwargs': {}},
     'ae': None,
     'loss': {'fcn': cem_loss, 'kwargs': {}},
@@ -112,15 +113,22 @@ class TFCEMOptimizer:
         return self.predictor(X, training=False)
 
 
-@register_backend(consumer_class='_CEM')
+@register_backend(consumer_class='_CEM', tag='PP')
 class TF_CEM_OPTIMIZER_PP(TFCEMOptimizer):
 
     def __init__(self,
                  predictor: Union[Callable, tf.keras.Model, 'keras.Model'],  # TODO: white-box shouldn't take Callable?
+                 mode: str,
                  loss_spec: Dict[str, Mapping[str, Any]] = None,
                  feature_range: Union[Tuple[Union[float, np.ndarray], Union[float, np.ndarray]], None] = None,
                  **kwargs):
-        ...
+        self._expected_attributes = set(CEM_LOSS_SPEC_WHITEBOX)
+
+        # pass loss specification to the superclass
+        if loss_spec is None:
+            loss_spec = CEM_LOSS_SPEC_WHITEBOX
+            loss_spec['prediction'] = loss_spec[f'{mode}_prediction']
+        super().__init__(predictor, loss_spec, feature_range, **kwargs)
 
     def reset_optimizer(self):
         self.optimizer = copy.deepcopy(self._optimizer_copy)
@@ -141,16 +149,28 @@ class TF_CEM_OPTIMIZER_PP(TFCEMOptimizer):
         ...
 
 
-@register_backend(consumer_class='_CEM')
+@register_backend(consumer_class='_CEM', tag='PN')
 class TF_CEM_OPTIMIZER_PN(TFCEMOptimizer):
+    def __init__(self,
+                 predictor: Union[Callable, tf.keras.Model, 'keras.Model'],  # TODO: white-box shouldn't take Callable?
+                 mode: str,
+                 loss_spec: Dict[str, Mapping[str, Any]] = None,
+                 feature_range: Union[Tuple[Union[float, np.ndarray], Union[float, np.ndarray]], None] = None,
+                 **kwargs):
+        self._expected_attributes = set(CEM_LOSS_SPEC_WHITEBOX)
+
+        # pass loss specification to the superclass
+        if loss_spec is None:
+            loss_spec = CEM_LOSS_SPEC_WHITEBOX
+            loss_spec['prediction'] = loss_spec[f'{mode}_prediction']
+        super().__init__(predictor, loss_spec, feature_range, **kwargs)
+
+
+@register_backend(consumer_class='_CEM', predictor_type='blackbox', tag='PP')
+class TF_CEM_Optimizer_BB_PP(TF_CEM_OPTIMIZER_PP):
     pass
 
 
-@register_backend(consumer_class='_CEM', predictor_type='blackbox')
-class TF_CEM_Optimizer_BB_PP(TFCEMOptimizer):
-    pass
-
-
-@register_backend(consumer_class='_CEM', predictor_type='blackbox')
-class TF_CEM_Optimizer_BB_PN(TFCEMOptimizer):
+@register_backend(consumer_class='_CEM', predictor_type='blackbox', tag='PN')
+class TF_CEM_Optimizer_BB_PN(TF_CEM_OPTIMIZER_PN):
     pass
