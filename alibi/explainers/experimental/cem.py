@@ -23,8 +23,8 @@ CEM_SEARCH_OPTS_DEFAULT = {
 }
 
 CEM_METHOD_OPTS = {
-    'kappa': 0.,
-    'beta': .1,
+    'kappa': 0.,  # TODO: in loss spec?
+    'beta': .1,  # TODO: in loss spec?
     'gamma': 0.,
     'no_info_val': None,
     'search_opts': CEM_SEARCH_OPTS_DEFAULT,
@@ -57,6 +57,7 @@ class CEM(Explainer, FitMixin):
     def __init__(self,
                  predictor: Union[Callable, 'tf.keras.Model', 'keras.Model'],
                  predictor_type: Literal['blackbox', 'whitebox'] = 'blackbox',
+                 mode: Literal['PP', 'PN', 'both'] = 'both',
                  loss_spec: Optional[dict] = None,
                  method_opts: Optional[dict] = None,
                  feature_range: Union[Tuple[Union[float, np.ndarray], Union[float, np.ndarray]], None] = None,
@@ -64,65 +65,88 @@ class CEM(Explainer, FitMixin):
                  **kwargs) -> None:
         # TODO: TBD should we compute both PN and PP by default or allow the user to choose (like now)?
         super().__init__(meta=copy.deepcopy(DEFAULT_META_CEM))
+        self._validate_mode(mode)
 
-        self._explainer_type = _CEM
+        # TODO: Alex: instantiate twice, then can hope to distribute (2 separate pools)
+        # each _CEM needs to know its mode which then can be communicated to the backend
+        self._explainer_type = _CEM  # required for parallelization
 
+        self._explainers = dict.fromkeys(self.modes)
         explainer_args = (predictor,)
-        explainer_kwargs = {
-            'predictor_type': predictor_type,
-            'loss_spec': loss_spec,
-            'method_opts': method_opts,
-            'feature_range': feature_range,
-            'framework': framework,
-        }  # type: Dict
-        self._explainer = self._explainer_type(*explainer_args, **explainer_kwargs, **kwargs)  # type: ignore
+        for mode in self.modes:
+            explainer_kwargs = {
+                'predictor_type': predictor_type,
+                'loss_spec': loss_spec,
+                'mode': mode,
+                'method_opts': method_opts,
+                'feature_range': feature_range,
+                'framework': framework,
+            }  # type: Dict
+            # self._explainer = self._explainer_type(*explainer_args, **explainer_kwargs, **kwargs)  # type: ignore
+            self._explainers[mode] = self._explainer_type(*explainer_args, **explainer_kwargs, **kwargs)
 
     def fit(self,
             X: Optional[np.ndarray] = None,
             no_info_type: Literal['mean', 'median'] = 'median') -> "CEM":
-        self._explainer.fit(X=X, no_info_type=no_info_type)
-        self._update_metadata(self._explainer.params, params=True)
+        # TODO: for loop seems excessive to do the same thing twice...
+        # Can either parallelize (useful if fit is different) or common setup
+        for _explainer in self._explainers.values():
+            _explainer.fit(X=X, no_info_type=no_info_type)
+            self._update_metadata(_explainer.params, params=True)
 
     def explain(self,
                 X: np.ndarray,
-                mode: Literal['PP', 'PN', 'both'] = 'both',
                 Y: Optional[np.ndarray] = None,  # TODO: TBD do we still want to support this?
                 logging_opts: Optional[dict] = None,
                 optimizer: Optional['tf.keras.optimizers.Optimizer'] = None,  # TODO: there are 2 optimizers...
                 optimizer_opts: Optional[dict] = None,
                 method_opts: Optional[dict] = None) -> "Explanation":
 
-        # self._validate_mode(mode)
+        # do one for now
+        results = dict.fromkeys(self.modes)
+        # TODO: parallelise here
+        for mode, _explainer in self._explainers.items():
 
-        # TODO: the following boilerplate seems common to many methods
-        # override default method settings with user input
-        if method_opts:
-            for key in method_opts:
-                if isinstance(method_opts[key], Dict):
-                    self._explainer.set_expected_attributes(method_opts[key])
-                else:
-                    self._explainer.set_expected_attributes({key: method_opts[key]})
+            # TODO: the following boilerplate seems common to many methods
+            # override default method settings with user input
+            if method_opts:
+                for key in method_opts:
+                    if isinstance(method_opts[key], Dict):
+                        _explainer.set_expected_attributes(method_opts[key])
+                    else:
+                        _explainer.set_expected_attributes({key: method_opts[key]})
 
-        if logging_opts:
-            self._explainer.logging_opts.update(logging_opts)
+            if logging_opts:
+                _explainer.logging_opts.update(logging_opts)
 
-        # TODO: do both calls? sequentially or parallel? or allow user to specify in explain?
-        result = self._explainer.cem(
-            X,
-            mode=mode,
-            optimizer=optimizer,
-            optimizer_opts=optimizer_opts
-        )
+            # TODO: parallelise
+            result = _explainer.cem(
+                X,
+                optimizer=optimizer,
+                optimizer_opts=optimizer_opts
+            )
+            results[mode] = result[mode]
+            results['instance_class'] = result['instance_class']
+            results['instance_proba'] = result['instance_proba']
 
-        self._update_metadata({'mode': mode}, params=True)
+        return self._build_explanation(X, results)
 
-        return self._build_explanation(X, result)
+    def _build_explanation(self, X: np.ndarray, results: dict) -> Explanation:
 
-    def _build_explanation(self, X: np.ndarray, result: dict) -> Explanation:
-        result['instance'] = X
-        explanation = Explanation(meta=copy.deepcopy(self.meta), data=result)
+        results['instance'] = X
+        explanation = Explanation(meta=copy.deepcopy(self.meta), data=results)
 
         return explanation
+
+    def _validate_mode(self, mode: str):
+        if mode not in CEM_VALID_EXPLAIN_MODES:
+            raise CEMError(f"Unknown mode {mode}. Valid explanations modes are {CEM_VALID_EXPLAIN_MODES}.")
+        if mode == 'both':
+            self.modes = ['PN', 'PP']
+            logger.warning(
+                f'Mode `{mode}` currently runs the two jobs sequentially. In the future this may be parallelized.')
+        else:
+            self.modes = [mode]
 
 
 # TODO: rename CounterfactualBase to be more general
@@ -132,6 +156,7 @@ class _CEM(CounterfactualBase):
                  predictor: Union[Callable, 'tf.keras.Model', 'keras.Model'],
                  framework: Literal['pytorch', 'tensorflow'] = 'tensorflow',
                  predictor_type: Literal['blackbox', 'whitebox'] = 'blackbox',
+                 mode: Literal['PP', 'PN', 'both'] = 'both',
                  loss_spec: Optional[dict] = None,
                  method_opts: Optional[dict] = None,
                  feature_range: Union[Tuple[Union[float, np.ndarray], Union[float, np.ndarray]], None] = None,
@@ -140,7 +165,6 @@ class _CEM(CounterfactualBase):
 
         _validate_cem_loss_spec(loss_spec, predictor_type)
         blackbox_wrapper = get_blackbox_wrapper(framework) if predictor_type == 'blackbox' else None
-        self.fitted = False
 
         super().__init__(
             predictor,
@@ -150,7 +174,7 @@ class _CEM(CounterfactualBase):
             feature_range,
             predictor_type=predictor_type,
             # can pass additional kwargs for backend initialization like this
-            backend_kwargs={'blackbox_wrapper': blackbox_wrapper},
+            backend_kwargs={'blackbox_wrapper': blackbox_wrapper, 'mode': mode},
             predictor_device=kwargs.get("predictor_device", None)
         )
 
@@ -162,6 +186,9 @@ class _CEM(CounterfactualBase):
         # set default options for logging (updated from the API class)
         self.logging_opts = copy.deepcopy(CEM_LOGGING_OPTS_DEFAULT)
         self.log_traces = self.logging_opts['log_traces']
+
+        # set explainer mode TODO: is this the correct place?
+        self.mode = mode
 
     def fit(self,
             X: Optional[np.ndarray] = None,
@@ -186,7 +213,8 @@ class _CEM(CounterfactualBase):
 
         self.params = {
             'no_info_type': self.no_info_type,
-            'fitted': self.fitted
+            'fitted': self.fitted,
+            'mode': self.mode
         }
 
         return self
@@ -199,18 +227,12 @@ class _CEM(CounterfactualBase):
             no_info_type_ = no_info_type
         self.no_info_type = no_info_type_
 
-    def _validate_mode(self, mode: str):
-        if mode not in CEM_VALID_EXPLAIN_MODES:
-            raise CEMError(f"Unknown mode {mode}. Valid explanations modes are {CEM_VALID_EXPLAIN_MODES}.")
-        self.mode = mode
-
     def cem(self,
             instance: np.ndarray,
-            mode: str,
             optimizer: Optional['tf.keras.optimizers.Optimizer'] = None,
             optimizer_opts: Optional[Dict] = None
             ):
-        self._validate_mode(mode)
+        # self._validate_mode(mode)
 
         # check inputs
         if instance.shape[0] != 1:
@@ -235,7 +257,6 @@ class _CEM(CounterfactualBase):
         if self.logging_opts['verbose']:
             logging.basicConfig(level=logging.DEBUG)
 
-        # TODO: where to parallelize?
         result = self.search(initial=instance)
 
         result['instance_class'] = instance_class
@@ -277,10 +298,10 @@ class _CEM(CounterfactualBase):
             self.backend.reset_optimizer()
 
             for gd_step in range(self.max_iter):
-                self.backend.step(mode=self.mode)
+                self.backend.step()  # TODO: can this be in parallel?
                 self.step += 1
 
-        return {'solution': self.backend.solution}
+        return {self.mode: self.backend.solution.numpy()}
 
     def bisect_const(self):
         ...

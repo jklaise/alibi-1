@@ -13,7 +13,7 @@ from alibi.explainers.backend.tensorflow.counterfactuals import range_constraint
 
 
 # TODO: TBD: minimize delta or the distance?
-def elastic_net_loss(beta: float, delta: tf.Variable) -> tf.Tensor:
+def elastic_net_loss(delta: tf.Variable, beta: float = .1) -> tf.Tensor:
     ax_sum = tuple(np.arange(1, len(delta.shape)))
     l1 = tf.reduce_sum(tf.abs(delta), axis=ax_sum)
     l2 = tf.reduce_sum(tf.square(delta), axis=ax_sum)
@@ -32,13 +32,13 @@ def get_max_nonsource_label_score(prediction: tf.Tensor, source_idx: int) -> tf.
         return values[:, 0]
 
 
-def hinge_loss_pn(prediction: tf.Tensor, kappa: float, source_idx: int) -> tf.Tensor:
+def hinge_loss_pn(prediction: tf.Tensor, source_idx: int, kappa: float = 0.) -> tf.Tensor:
     source_label_score = get_source_label_score(prediction, source_idx)
     max_nonsource_label_score = get_max_nonsource_label_score(prediction, source_idx)
     return tf.maximum(0.0, -max_nonsource_label_score + source_label_score + kappa)
 
 
-def hinge_loss_pp(prediction: tf.Tensor, kappa: float, source_idx: int) -> tf.Tensor:
+def hinge_loss_pp(prediction: tf.Tensor, source_idx: int, kappa: float = 0.) -> tf.Tensor:
     source_label_score = get_source_label_score(prediction, source_idx)
     max_nonsource_label_score = get_max_nonsource_label_score(prediction, source_idx)
     return tf.maximum(0.0, max_nonsource_label_score - source_label_score + kappa)
@@ -47,7 +47,8 @@ def hinge_loss_pp(prediction: tf.Tensor, kappa: float, source_idx: int) -> tf.Te
 def cem_loss(const: float, pred: tf.Tensor, distance: tf.Tensor, ae: tf.Tensor) -> tf.Tensor:
     return const * pred + distance + ae
 
-
+# TODO: might be easier to use 2 separate losses so as to be able to change so as to use 2 different method_opts
+# together in the same call?
 CEM_LOSS_SPEC_WHITEBOX = {
     'PP_prediction': {'fcn': hinge_loss_pp, 'kwargs': {'kappa': 0.}},  # TODO: doubly defined
     'PN_prediction': {'fcn': hinge_loss_pn, 'kwargs': {'kappa': 0.}},  # TODO: doubly defined
@@ -73,6 +74,7 @@ class TFCEMOptimizer:
                  **kwargs
                  ):
         self.predictor = predictor
+        self.mode = kwargs.get('mode')
         self._expected_attributes = set(CEM_LOSS_SPEC_WHITEBOX)
 
         if loss_spec is None:
@@ -105,11 +107,7 @@ class TFCEMOptimizer:
     def set_default_optimizer(self) -> None:
         # learning_rate_init = 1e-2 in old CEM
         self.lr_schedule = PolynomialDecay(1e-2, self.max_iter, end_learning_rate=0, power=0.5)
-        optimizer = SGD(learning_rate=self.lr_schedule)
-        self.optimizers = {
-            'PP': copy.deepcopy(optimizer),
-            'PN': copy.deepcopy(optimizer)
-        }
+        self.optimizer = SGD(learning_rate=self.lr_schedule)
 
     # TODO: duplicated in CF
     def set_optimizer(self, optimizer: tf.keras.optimizers.Optimizer, optimizer_opts: Dict[str, Any]) -> None:
@@ -118,71 +116,67 @@ class TFCEMOptimizer:
         if optimizer is None:
             self.set_default_optimizer()
             # copy used for resetting optimizer for every c
-            self._optimizer_copy = copy.deepcopy(self.optimizers)
+            self._optimizer_copy = copy.deepcopy(self.optimizer)
             return
 
         # user passed the initialised object
         if isinstance(optimizer, tf.keras.optimizers.Optimizer):
-            self.optimizers = {
-                'PP': copy.deepcopy(optimizer),
-                'PN': copy.deepcopy(optimizer)
-            }  # user passed just the name of the class
+            self.optimizer = optimizer(**optimizer_opts)  # user passed just the name of the class
         else:
             if optimizer_opts is not None:
-                optimizer = optimizer(**optimizer_opts)
+                self.optimizer = optimizer(**optimizer_opts)
             else:
-                optimizer = optimizer()
-            self.optimizers = {
-                'PP': copy.deepcopy(optimizer),
-                'PN': copy.deepcopy(optimizer)
-            }
+                self.optimizer = optimizer()
 
-        self._optimizer_copy = copy.deepcopy(self.optimizers)
+        self._optimizer_copy = copy.deepcopy(self.optimizer)
 
     def reset_optimizer(self) -> None:
-        self.optimizers = copy.deepcopy(self._optimizer_copy)
+        self.optimizer = copy.deepcopy(self._optimizer_copy)
 
-    def initialise_variables(self, instance: np.ndarray, mode: str, *args, **kwargs) -> None:
+    def initialise_variables(self, instance: np.ndarray, *args, **kwargs) -> None:
         self.instance = tf.identity(instance, name='instance')
         self.instance_class = kwargs.get('instance_class')
         self.instance_proba = kwargs.get('instance_proba')
 
-        self.initialise_solution(instance=instance, mode=mode)
+        self.initialise_solution(instance=instance)
         # raise NotImplementedError("Concrete implementations should implement variables initialisation!")
 
-    def initialise_solution(self, instance: np.ndarray, mode: str) -> None:
+    def initialise_solution(self, instance: np.ndarray) -> None:
         constraint_fn = None
         if self.solution_constraint is not None:
             constraint_fn = partial(range_constraint(low=self.solution_constraint[0], high=self.solution_constraint[1]))
         self.solution = tf.Variable(
             initial_value=instance,
             trainable=True,
-            name=f"{mode}",
+            name=f"{self.mode}",
             constraint=constraint_fn
         )
 
-    def step(self, mode: str) -> None:
-        gradients = self.get_autodiff_gradients(mode)
-        self.apply_gradients(gradients, mode)
+    # TODO: can inherit with *args, **kwargs
+    def step(self) -> None:
+        gradients = self.get_autodiff_gradients()
+        self.apply_gradients(gradients)
 
-    def get_autodiff_gradients(self, mode: str) -> List[tf.Tensor]:
+    def get_autodiff_gradients(self) -> List[tf.Tensor]:
         with tf.GradientTape() as tape:
-            loss = self.autograd_loss(mode)
+            loss = self.autograd_loss()
         gradients = tape.gradient(loss, [self.solution])
 
         return gradients
 
-    def autograd_loss(self, mode: str) -> tf.Tensor:
+    # TODO: depending on mode create appropriate loss
+    def autograd_loss(self) -> tf.Tensor:
         norm_loss = self.norm_fcn(delta=self.solution)
         prediction = self.make_prediction(self.solution)
-        # TODO: hardcoded!
-        pred_loss = self.PN_prediction_fcn(prediction=prediction, source_idx=self.instance_class)
+        # this is where we pick up the relevant PP or PN loss
+        pred_fcn = getattr(self, f'{self.mode}_prediction_fcn')
+        pred_loss = pred_fcn(prediction=prediction, source_idx=self.instance_class)
         total_loss = self.loss_fcn(const=self.const, pred=pred_loss, distance=norm_loss, ae=0.)
 
         return total_loss
 
-    def apply_gradients(self, gradients: List[tf.Tensor], mode: str) -> None:
-        self.optimizers[mode].apply_gradients(zip(gradients, [self.solution]))
+    def apply_gradients(self, gradients: List[tf.Tensor]) -> None:
+        self.optimizer.apply_gradients(zip(gradients, [self.solution]))
 
     def update_state(self):
         raise NotImplementedError("Sub-class should implemented method for updating state.")
