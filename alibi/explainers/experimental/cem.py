@@ -284,10 +284,12 @@ class _CEM(CounterfactualBase):
         # set the lower and upper bounds for the constant 'c' to scale the attack loss term
         # these bounds are updated for each c_step iteration
         const_lb = self.const_lower_bound
-        cont_ub = self.const_upper_bound
+        const_ub = self.const_upper_bound
         const = self.const_init
 
         # initial values for the best instance
+        overall_best_dist = 1e10
+        overall_best_instance = np.zeros_like(initial)
 
         # iterate over the number of updates for 'const'
         for const_step in range(self.max_const_steps):
@@ -297,11 +299,48 @@ class _CEM(CounterfactualBase):
             # reset learning rate
             self.backend.reset_optimizer()
 
+            # current best distances and scores
+            current_best_dist = 1e10
+            current_best_proba = -1
+
             for gd_step in range(self.max_iter):
                 self.backend.step()  # TODO: can this be in parallel?
                 self.step += 1
 
-        return {self.mode: self.backend.solution.numpy()}
+                # update best perturbation (distance) and class probabilities
+                # if beta * L1 + L2 < current best and predicted label is the same as the initial label (for PP) or
+                # different from the initial label (for PN); update best current step or global perturbations
+
+                # current step
+                proba = self.backend.make_prediction(self.backend.solution)[0] # TODO: deal with index somewhere else?
+                norm = self.backend.norm_fcn(self.backend.solution)
+                if norm < current_best_dist and self.compare(proba, self.instance_class):
+                    current_best_dist = norm
+                    current_best_proba = np.argmax(proba)
+
+                # global
+                if norm < overall_best_dist and self.compare(proba, self.instance_class): # TODO: duplicated comparison
+                    overall_best_dist = norm
+                    overall_best_instance = self.backend.solution.numpy()
+
+            # adjust the constant for the first loss term
+            if (self.compare(current_best_proba, self.instance_class)) and current_best_proba != -1:
+                # want to refine the current best solution by putting more emphasis on the regularization terms
+                # of the loss by reducing 'c'; aiming to find a perturbation closer to the original instance
+                const_ub = min(const_ub, const)
+                if const_ub < 1e9:
+                    const = (const_lb + const_ub) / 2
+            else:
+                # no valid current solution; put more weight on the first loss term to try and meet the
+                # prediction constraint before finetuning the solution with the regularization terms
+                const_lb = max(const_lb, const)  # update lower bound to constant
+                if const_ub < 1e9:
+                    const = (const_lb+ const_ub) / 2
+                else:
+                    const *= 10
+
+
+        return {self.mode: overall_best_instance}
 
     def bisect_const(self):
         ...

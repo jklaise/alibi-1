@@ -201,7 +201,7 @@ class TFCEMOptimizer:
 
     # TODO: TBD make_prediction can also be in a mixin class?
     def make_prediction(self, X: Union[np.ndarray, tf.Variable, tf.Tensor]) -> tf.Tensor:
-        return self.predictor(X, training=False)
+        return self.predictor(X, training=False).numpy()
 
 
 @register_backend(consumer_class='_CEM', predictor_type='blackbox')
